@@ -1,4 +1,6 @@
+//#include<elf.h>
+
 int main(int argc)
 {
-    //exit(45);
+   // exit(42);
 }

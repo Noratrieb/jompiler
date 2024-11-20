@@ -333,12 +333,17 @@ function lower(ast) {
   strategy: every expression returns its result in rax.
   */
 
+  function littleEndian16(number) {
+    assertDefined(number);
+    return [number & 0xff, (number >> 8) & 0xff];
+  }
   function littleEndian32(number) {
+    assertDefined(number);
     return [
-      number & 0xf,
-      (number >> 8) & 0xf,
-      (number >> 16) & 0xf,
-      (number >> 24) & 0xf,
+      number & 0xff,
+      (number >> 8) & 0xff,
+      (number >> 16) & 0xff,
+      (number >> 24) & 0xff,
     ];
   }
 
@@ -357,10 +362,9 @@ function lower(ast) {
   }
 
   class InstBuilder {
-    #out;
     #stackSize;
     constructor() {
-      this.#out = new Uint8Array();
+      this.out = new Uint8Array();
       this.#stackSize = 0;
     }
 
@@ -372,14 +376,19 @@ function lower(ast) {
     movEaxImm32(imm) {
       // mov eax, imm
       this.#append([
-        0xc7,
+        0xC7,
         modRm(MOD_REG, RM_A, REG_IGNORED),
         ...littleEndian32(imm),
       ]);
     }
 
+    ret() {
+      // ret ; near return to calling prodecude
+      this.#append([0xc3]);
+    }
+
     #append(code) {
-      this.#out += code;
+      this.out = Buffer.concat([this.out, new Uint8Array(code)]);
     }
   }
 
@@ -426,20 +435,294 @@ function lower(ast) {
       }
     }
 
+    ib.movEaxImm32(0);
+    ib.ret();
+
     return ib;
   }
 
+  class BufferBuilder {
+    constructor() {
+      this.buffer = new Uint8Array();
+    }
+    append(array) {
+      assertDefined(array);
+      this.buffer = Buffer.concat([this.buffer, new Uint8Array(array)]);
+    }
+    get currentPos() {
+      return this.buffer.length;
+    }
+  }
+
+  function generateObjectFile(funcs) {
+    if (funcs.length !== 1) {
+      throw new Error("bad");
+    }
+
+    const textContent = funcs[0].code;
+    const textRelativeSymbols = [
+      {
+        name: funcs[0].name,
+        offset: 0,
+        size: funcs[0].code.length,
+      },
+    ];
+
+    let out = new BufferBuilder();
+    // ident
+    out.append([0x7f, "E".charCodeAt(0), "L".charCodeAt(0), "F".charCodeAt(0)]);
+    out.append([
+      /*ELFCLASS64*/ 2, /*ELFDATA2LSB*/ 1, /*EV_CURRENT*/ 1,
+      /*ELFOSABI_SYSV*/ 0, /*EI_ABIVERSION*/ 0, /*EI_PAD*/ 0, 0, 0, 0, 0, 0, 0,
+    ]);
+
+    let shoffRef;
+    let shnumRef;
+    let shstrndxRef;
+    let sectionOffsetRefs = {};
+
+    // type
+    out.append([/*ET_REL*/ 1, 0]);
+    // machine
+    out.append([/*EM_X86_64*/ 62, 0]);
+    // version
+    out.append([/*EV_CURRENT*/ 1, 0, 0, 0]);
+    // entry
+    out.append([0, 0, 0, 0, 0, 0, 0, 0]);
+    // phoff
+    out.append([0, 0, 0, 0, 0, 0, 0, 0]); // no ph
+    // shoff
+    shoffRef = out.currentPos;
+    out.append([0, 0, 0, 0, 0, 0, 0, 0]);
+    // flags
+    out.append([0, 0, 0, 0]);
+    // ehsize
+    out.append([64, 0]);
+    // phentsize
+    out.append([0, 0]); // no ph
+    // phnum
+    out.append([0, 0]);
+    // shentsize
+    out.append([64, 0]);
+    // shnum
+    shnumRef = out.currentPos;
+    out.append([0, 0]);
+    // shstrndx
+    shstrndxRef = out.currentPos;
+    out.append([0, 0]);
+
+    // Let's write some section headers.
+
+    const shoff = littleEndian32(out.currentPos);
+    out.buffer[shoffRef] = shoff[0];
+    out.buffer[shoffRef + 1] = shoff[1];
+    out.buffer[shoffRef + 2] = shoff[2];
+    out.buffer[shoffRef + 3] = shoff[3];
+
+    class NullTerminatedStringStore {
+      #offsets;
+      constructor() {
+        this.#offsets = new Map();
+        this.out = new BufferBuilder();
+      }
+      pushAndGet(str) {
+        if (this.#offsets.has(str)) {
+          return this.#offsets.get(str);
+        }
+        const offset = this.out.buffer.length;
+        this.#offsets.set(str, offset);
+        this.out.append(new TextEncoder("utf-8").encode(str));
+        this.out.append([0]);
+        return offset;
+      }
+    }
+
+    const shstrs = new NullTerminatedStringStore();
+    shstrs.pushAndGet("");
+    shstrs.pushAndGet(".shstrtab"); // ensure that this is already present so it doesn't get added afterwards when we already got the length
+    const strs = new NullTerminatedStringStore();
+    strs.pushAndGet("");
+    let sectionCount = 0;
+
+    const writeSectionHeader = (name, sh) => {
+      sectionCount++;
+      const nameIndex = shstrs.pushAndGet(name);
+      out.append([
+        ...littleEndian32(nameIndex),
+        ...littleEndian32(sh.type),
+        ...littleEndian32(sh.flags),
+        ...[0, 0, 0, 0], // flag pad
+        ...littleEndian32(sh.addr),
+        ...[0, 0, 0, 0],
+      ]);
+      sectionOffsetRefs[name] = out.currentPos;
+      out.append([
+        ...littleEndian32(sh.offset),
+        ...[0, 0, 0, 0],
+        ...littleEndian32(sh.size),
+        ...[0, 0, 0, 0],
+        ...littleEndian32(sh.link),
+        ...littleEndian32(sh.info),
+        ...littleEndian32(sh.addralign),
+        ...[0, 0, 0, 0],
+        ...littleEndian32(sh.entsize),
+        ...[0, 0, 0, 0],
+      ]);
+    };
+
+    // null section
+    writeSectionHeader("", {
+      type: 0,
+      flags: 0,
+      addr: 0,
+      offset: 0,
+      size: 0,
+      link: 0,
+      info: 0,
+      addralign: 0,
+      entsize: 0,
+    });
+
+    // text section
+    writeSectionHeader(".text", {
+      type: /*SHT_PROGBITS*/ 1,
+      flags: /*SHF_ALLOC*/ (1 << 1) | /*SHF_EXECINSTR*/ (1 << 2),
+      addr: 0,
+      offset: 0,
+      size: textContent.length,
+      link: 0,
+      info: 0,
+      addralign: 16,
+      entsize: 0,
+    });
+
+    const symtab = new BufferBuilder();
+    const nameToSymIdx = new Map();
+    let symIdx = 0;
+    for (const sym of textRelativeSymbols) {
+      const nameIdx = strs.pushAndGet(sym.name);
+
+      symtab.append([
+        ...littleEndian32(nameIdx),
+        /*STT_FUNC*/ 2 | /*STB_GLOBAL*/ (1 << 4),
+        /*STV_DEFAULT*/ 0,
+        /*shndx .text*/ ...littleEndian16(1),
+        /*value*/ ...littleEndian32(sym.offset),
+        ...[0, 0, 0, 0],
+        /*size*/ ...littleEndian32(sym.size),
+        ...[0, 0, 0, 0],
+      ]);
+      nameToSymIdx.set(sym.name, symIdx);
+      symIdx++;
+    }
+
+    console.log(symtab);
+
+    // symtab section
+    const strTableIndex = sectionCount + 1;
+    writeSectionHeader(".symtab", {
+      type: /*SHT_SYMTAB*/ 2,
+      flags: 0,
+      addr: 0,
+      offset: 0,
+      size: symtab.buffer.length,
+      link: strTableIndex,
+      info: 0,
+      addralign: 8,
+      entsize: 24,
+    });
+
+    // strtab section
+    writeSectionHeader(".strtab", {
+      type: /*SHT_STRTAB*/ 3,
+      flags: 0,
+      addr: 0,
+      offset: 0,
+      size: strs.out.buffer.length,
+      link: 0,
+      info: 0,
+      addralign: 1,
+      entsize: 0,
+    });
+
+    const shstrndx = littleEndian32(sectionCount);
+    out.buffer[shstrndxRef] = shstrndx[0];
+    out.buffer[shstrndxRef + 1] = shstrndx[1];
+
+    const totalSectionCount = littleEndian32(sectionCount + 1);
+    out.buffer[shnumRef] = totalSectionCount[0];
+    out.buffer[shnumRef + 1] = totalSectionCount[1];
+
+    // shstrtab section
+    writeSectionHeader(".shstrtab", {
+      type: /*SHT_STRTAB*/ 3,
+      flags: 0,
+      addr: 0,
+      offset: 0,
+      size: shstrs.out.buffer.length,
+      link: 0,
+      info: 0,
+      addralign: 1,
+      entsize: 0,
+    });
+
+    const alignTo = (align) => {
+      assertDefined(align);
+      const up = align - (out.buffer.length % align);
+      out.append(Array(up).fill(0));
+    };
+
+    const patch32 = (baseOffset, value) => {
+      assertDefined(baseOffset, value);
+      const encoded = littleEndian32(value);
+      out.buffer[baseOffset] = encoded[0];
+      out.buffer[baseOffset + 1] = encoded[1];
+      out.buffer[baseOffset + 2] = encoded[2];
+      out.buffer[baseOffset + 3] = encoded[3];
+    };
+
+    alignTo(16);
+    patch32(sectionOffsetRefs[".text"], out.currentPos);
+    out.append(textContent);
+
+    patch32(sectionOffsetRefs[".strtab"], out.currentPos);
+    out.append(strs.out.buffer);
+
+    alignTo(8);
+    patch32(sectionOffsetRefs[".symtab"], out.currentPos);
+    out.append(symtab.buffer);
+
+    patch32(sectionOffsetRefs[".shstrtab"], out.currentPos);
+    out.append(shstrs.out.buffer);
+
+    return out.buffer;
+  }
+
+  const funcs = [];
+
   for (const func of ast) {
     const ib = codegenFunction(func);
+    funcs.push({
+      name: func.name.ident,
+      code: ib.out,
+    });
   }
+
+  console.log(funcs);
+
+  const obj = generateObjectFile(funcs);
+
+  return obj;
 }
 
-function compile(input) {
+async function compile(input) {
   const tokens = lex(input);
   console.log(tokens);
   const ast = parse(tokens);
   console.dir(ast, { depth: 20 });
-  lower(ast);
+  const object = lower(ast);
+
+  fs.writeFile("output.o", object);
 }
 
 const fileName = process.argv[2];
@@ -447,11 +730,17 @@ const input = await fs.readFile(fileName, "utf-8");
 console.log(input);
 
 try {
-  compile(input);
+  await compile(input);
 } catch (e) {
   if (e instanceof CompilerError) {
     console.error(e.render(fileName, input));
   } else {
     throw e;
+  }
+}
+
+function assertDefined(...values) {
+  if (values.some((value) => value === undefined || value === null)) {
+    throw new Error(`assertion failed, value undefined or null`);
   }
 }
