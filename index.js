@@ -103,7 +103,8 @@ function lex(input) {
         case "{":
         case "}":
         case ",":
-        case ";": {
+        case ";":
+        case "+": {
           tokens.push({
             kind: head,
             span: i - 1,
@@ -258,8 +259,23 @@ function parse(tokens) {
       return lhs;
     }
 
-    const parseLogicalAnd = generateBinaryParser(["&&"], parsePostfix);
+    const parseMultiplicative = generateBinaryParser(
+      ["*", "/", "%"],
+      parsePostfix
+    );
+    const parseAdditive = generateBinaryParser(["+", "-"], parseMultiplicative);
+    const parseShift = generateBinaryParser(["<<", ">>"], parseAdditive);
+    const parseRelational = generateBinaryParser(
+      ["<", ">", "<=", ">="],
+      parseShift
+    );
+    const parseEquality = generateBinaryParser(["==", "!="], parseRelational);
+    const parseAnd = generateBinaryParser(["&"], parseEquality);
+    const parseExclusiveOr = generateBinaryParser(["^"], parseAnd);
+    const parseInclusiveOr = generateBinaryParser(["|"], parseExclusiveOr);
+    const parseLogicalAnd = generateBinaryParser(["&&"], parseInclusiveOr);
     const parseLogicalOr = generateBinaryParser(["||"], parseLogicalAnd);
+    // TODO conditional operator
     const parseAssignment = generateBinaryParser(
       ["=", "*=", "/=", "%=", "+=", "-=", "<<=", ">>=", "&=", , "^=", "|="],
       parseLogicalOr
@@ -516,6 +532,8 @@ function lower(ast) {
         break;
       }
       case "+": {
+        codegenExpr(ib, expr.rhs);
+        assert(false);
       }
       default: {
         throw new Error(`unsupported expr: ${expr.kind}`);

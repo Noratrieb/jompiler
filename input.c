@@ -7,5 +7,5 @@ int main(int argc)
 
 int thisismyfakeconstantbecauseidonthaveconstant(int x)
 {
-   return 9;
+   return 1 + 1;
 }
