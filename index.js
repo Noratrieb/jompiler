@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 
 // https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf
@@ -6,9 +7,8 @@ import fs from "node:fs/promises";
 class CompilerError extends Error {
   constructor(message, span) {
     super(message);
-    if (!span) {
-      throw new Error("span must be present");
-    }
+    assertDefined(message);
+    assertDefined(span);
     this.span = span;
   }
 
@@ -358,7 +358,7 @@ function lower(ast) {
   const REG_IGNORED = 0;
 
   function modRm(mod, rm, reg) {
-    return (mod >> 6) | rm | (reg << 3);
+    return (mod << 6) | rm | (reg << 3);
   }
 
   class InstBuilder {
@@ -376,7 +376,7 @@ function lower(ast) {
     movEaxImm32(imm) {
       // mov eax, imm
       this.#append([
-        0xC7,
+        0xc7,
         modRm(MOD_REG, RM_A, REG_IGNORED),
         ...littleEndian32(imm),
       ]);
@@ -422,8 +422,6 @@ function lower(ast) {
     const ib = new InstBuilder();
 
     for (const stmt of func.body) {
-      console.log("doing cg for", stmt.kind);
-
       switch (stmt.kind) {
         case "expr": {
           codegenExpr(ib, stmt.expr);
@@ -616,8 +614,6 @@ function lower(ast) {
       symIdx++;
     }
 
-    console.log(symtab);
-
     // symtab section
     const strTableIndex = sectionCount + 1;
     writeSectionHeader(".symtab", {
@@ -715,6 +711,29 @@ function lower(ast) {
   return obj;
 }
 
+function link(object) {
+  // we could use a temporary directory in the future, but let's keep this debuggable for now
+  const outputFile = "output.o";
+  fs.writeFile(outputFile, object);
+
+  return new Promise((resolve, reject) => {
+    const gcc = spawn("gcc", [outputFile]);
+    gcc.stdout.on("data", (data) => {
+      process.stdout.write(data);
+    });
+    gcc.stderr.on("data", (data) => {
+      process.stderr.write(data);
+    });
+    gcc.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new CompilerError("gcc failed to link", 0));
+      }
+    })
+  });
+}
+
 async function compile(input) {
   const tokens = lex(input);
   console.log(tokens);
@@ -722,7 +741,7 @@ async function compile(input) {
   console.dir(ast, { depth: 20 });
   const object = lower(ast);
 
-  fs.writeFile("output.o", object);
+  return link(object);
 }
 
 const fileName = process.argv[2];
