@@ -2,5 +2,5 @@
 
 int main(int argc)
 {
-   // exit(42);
+   exit(42);
 }

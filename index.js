@@ -33,8 +33,16 @@ class CompilerError extends Error {
 }
 
 function lex(input) {
-  function alphabetic(char) {
-    return (char >= "a" && char <= "z") || (char >= "A" && char <= "Z");
+  // 6.4.2 Identifiers
+  function identifierStart(char) {
+    return (
+      (char >= "a" && char <= "z") ||
+      (char >= "A" && char <= "Z") ||
+      char === "_"
+    );
+  }
+  function identifierCont(char) {
+    return identifierStart(char) || (char >= "0" && char <= "9");
   }
 
   const tokens = [];
@@ -63,10 +71,10 @@ function lex(input) {
         integer: Number(number),
         span,
       });
-    } else if (alphabetic(head)) {
+    } else if (identifierStart(head)) {
       const span = i - 1;
       let ident = head;
-      while (alphabetic(input[i])) {
+      while (identifierCont(input[i])) {
         ident += input[i];
         i++;
       }
@@ -346,17 +354,64 @@ function lower(ast) {
       (number >> 24) & 0xff,
     ];
   }
+  function littleEndian64(number) {
+    assertDefined(number);
+    assert(number <= 0xff_ff_ff_ff);
+    return [...littleEndian32(number), 0, 0, 0, 0];
+  }
+  function signedLittleEndian64(number) {
+    assertDefined(number);
+    assert(number <= 0xff_ff_ff_ff);
+    assert(number >= -(0xff_ff_ff_ff + 1));
 
+    const array = littleEndian64(number);
+    const signBit = array[3] & 0b10000000;
+    if (signBit) {
+      array[4] = 0xff;
+      array[5] = 0xff;
+      array[6] = 0xff;
+      array[7] = 0xff;
+    }
+    console.log(array);
+    return array;
+  }
+
+  const RELOCATIONS = {
+    R_X86_64_PC32: 2,
+  };
+  const SYMBOL_TYPES = {
+    STT_NOTYPE: 0,
+    STT_FUNC: 2,
+  };
+  const SYMBOL_BINDING = {
+    STB_GLOBAL: 1,
+  };
+  const SYMBOL_VISIBILITY = {
+    STV_DEFAULT: 0,
+  };
+
+  // 2.1.3 ModR/M and SIB Bytes
   const MOD_REG = 0b11;
 
   const RM_A = 0b000;
   const RM_C = 0b001;
+  const RM_D = 0b010;
+  const RM_B = 0b011;
+  const RM_SP = 0b100;
+  const RM_BP = 0b101;
+  const RM_SI = 0b110;
+  const RM_DI = 0b111;
 
   const REG_A = RM_A;
   const REG_C = RM_C;
+  const REG_D = RM_D;
+  const REG_B = RM_B;
+  const REG_SP = RM_SP;
+  const REG_BP = RM_BP;
+  const REG_SI = RM_SI;
+  const REG_DI = RM_DI;
 
   const REG_IGNORED = 0;
-
   function modRm(mod, rm, reg) {
     return (mod << 6) | rm | (reg << 3);
   }
@@ -365,6 +420,7 @@ function lower(ast) {
     #stackSize;
     constructor() {
       this.out = new Uint8Array();
+      this.relocations = [];
       this.#stackSize = 0;
     }
 
@@ -380,6 +436,25 @@ function lower(ast) {
         modRm(MOD_REG, RM_A, REG_IGNORED),
         ...littleEndian32(imm),
       ]);
+    }
+
+    movEaxToEdi() {
+      // mov edi, eax ; Move r/m32 to r32
+      this.#append([0x8b, modRm(MOD_REG, RM_A, RM_DI)]);
+    }
+
+    call(symbol) {
+      // call rel32 ; Call near, relative, displacement relative to next
+      //            ; instruction. 32-bit displacement sign extended to
+      //            ; 64-bits in 64-bit mode
+      this.#append([0xe8]);
+      this.relocations.push({
+        kind: RELOCATIONS.R_X86_64_PC32,
+        symbol,
+        offset: this.out.length,
+        addend: -4,
+      });
+      this.#append([0x0, 0x0, 0x0, 0x0]);
     }
 
     ret() {
@@ -402,7 +477,9 @@ function lower(ast) {
           throw new Error("bad");
         }
 
-        const arg0 = codegenExpr(ib, expr.args[0]);
+        codegenExpr(ib, expr.args[0]);
+        ib.movEaxToEdi();
+        ib.call(expr.lhs.string);
 
         break;
       }
@@ -445,6 +522,7 @@ function lower(ast) {
     }
     append(array) {
       assertDefined(array);
+      array.forEach((elem) => assert(typeof elem === "number"));
       this.buffer = Buffer.concat([this.buffer, new Uint8Array(array)]);
     }
     get currentPos() {
@@ -453,18 +531,69 @@ function lower(ast) {
   }
 
   function generateObjectFile(funcs) {
-    if (funcs.length !== 1) {
-      throw new Error("bad");
+    const alignTo = (out, align) => {
+      assertDefined(out, align);
+      const missing = out.buffer.length % align;
+      if (missing === 0) {
+        return;
+      }
+      const up = align - missing;
+      out.append(Array(up).fill(0));
+    };
+
+    function layoutFuncs(funcs) {
+      const textContent = new BufferBuilder();
+
+      const textRelativeSymbols = [];
+      const relocations = [];
+
+      funcs.forEach((func) => {
+        alignTo(textContent, 8); // i think this is not actually necessary.
+        const offset = textContent.buffer.length;
+        textRelativeSymbols.push({
+          name: func.name,
+          offset,
+          size: func.code.length,
+        });
+        relocations.push(
+          ...func.relocations.map((relocation) => ({
+            kind: relocation.kind,
+            symbol: relocation.symbol,
+            addend: relocation.addend,
+            offset: offset + relocation.offset,
+          }))
+        );
+        textContent.append(func.code);
+      });
+
+      return {
+        textContent: textContent.buffer,
+        textRelativeSymbols,
+        relocations,
+      };
     }
 
-    const textContent = funcs[0].code;
-    const textRelativeSymbols = [
-      {
-        name: funcs[0].name,
-        offset: 0,
-        size: funcs[0].code.length,
-      },
-    ];
+    const symbols = [];
+
+    const {
+      textContent,
+      textRelativeSymbols,
+      relocations: funcRelocations,
+    } = layoutFuncs(funcs);
+
+    for (const sym of textRelativeSymbols) {
+      symbols.push({
+        name: sym.name,
+        type: SYMBOL_TYPES.STT_FUNC,
+        binding: SYMBOL_BINDING.STB_GLOBAL,
+        visibility: SYMBOL_VISIBILITY.STV_DEFAULT,
+        sectionIndex: 1 /*.text*/,
+        value: sym.offset,
+        size: sym.size,
+      });
+    }
+
+    console.log(funcRelocations);
 
     let out = new BufferBuilder();
     // ident
@@ -548,23 +677,17 @@ function lower(ast) {
       out.append([
         ...littleEndian32(nameIndex),
         ...littleEndian32(sh.type),
-        ...littleEndian32(sh.flags),
-        ...[0, 0, 0, 0], // flag pad
-        ...littleEndian32(sh.addr),
-        ...[0, 0, 0, 0],
+        ...littleEndian64(sh.flags),
+        ...littleEndian64(sh.addr),
       ]);
       sectionOffsetRefs[name] = out.currentPos;
       out.append([
-        ...littleEndian32(sh.offset),
-        ...[0, 0, 0, 0],
-        ...littleEndian32(sh.size),
-        ...[0, 0, 0, 0],
+        ...littleEndian64(sh.offset),
+        ...littleEndian64(sh.size),
         ...littleEndian32(sh.link),
         ...littleEndian32(sh.info),
-        ...littleEndian32(sh.addralign),
-        ...[0, 0, 0, 0],
-        ...littleEndian32(sh.entsize),
-        ...[0, 0, 0, 0],
+        ...littleEndian64(sh.addralign),
+        ...littleEndian64(sh.entsize),
       ]);
     };
 
@@ -582,6 +705,8 @@ function lower(ast) {
     });
 
     // text section
+    const textIndex = sectionCount;
+    console.log(textContent);
     writeSectionHeader(".text", {
       type: /*SHT_PROGBITS*/ 1,
       flags: /*SHF_ALLOC*/ (1 << 1) | /*SHF_EXECINSTR*/ (1 << 2),
@@ -594,21 +719,58 @@ function lower(ast) {
       entsize: 0,
     });
 
+    const rel = new BufferBuilder();
+    for (const relocation of funcRelocations) {
+      let idx = symbols.findIndex((sym) => sym.name === relocation.symbol);
+      if (idx === -1) {
+        idx = symbols.length;
+        symbols.push({
+          name: relocation.symbol,
+          type: SYMBOL_TYPES.STT_NOTYPE,
+          binding: SYMBOL_BINDING.STB_GLOBAL,
+          visibility: SYMBOL_VISIBILITY.STV_DEFAULT,
+          sectionIndex: 0,
+          value: 0,
+          size: 0,
+        });
+      }
+      console.log(rel.buffer.length);
+      // r_offset
+      rel.append([...littleEndian32(relocation.offset), ...[0, 0, 0, 0]]);
+      // r_info type,sym
+      rel.append(littleEndian32(relocation.kind));
+      rel.append(littleEndian32(idx));
+      // r_addend
+      rel.append(signedLittleEndian64(relocation.addend));
+    }
+    console.log(symbols, rel.buffer.length);
+    const symtabIndex = sectionCount + 1;
+    console.log("text", textIndex);
+    writeSectionHeader(".rela", {
+      type: /*SHT_RELA*/ 4,
+      flags: 0,
+      addr: 0,
+      offset: 0,
+      size: rel.buffer.length,
+      link: symtabIndex,
+      info: textIndex,
+      addralign: 8,
+      entsize: 24,
+    });
+
     const symtab = new BufferBuilder();
     const nameToSymIdx = new Map();
     let symIdx = 0;
-    for (const sym of textRelativeSymbols) {
+    for (const sym of symbols) {
       const nameIdx = strs.pushAndGet(sym.name);
 
       symtab.append([
         ...littleEndian32(nameIdx),
-        /*STT_FUNC*/ 2 | /*STB_GLOBAL*/ (1 << 4),
-        /*STV_DEFAULT*/ 0,
-        /*shndx .text*/ ...littleEndian16(1),
-        /*value*/ ...littleEndian32(sym.offset),
-        ...[0, 0, 0, 0],
-        /*size*/ ...littleEndian32(sym.size),
-        ...[0, 0, 0, 0],
+        sym.type | (sym.binding << 4),
+        sym.visibility,
+        /*shndx*/ ...littleEndian16(sym.sectionIndex),
+        /*value*/ ...littleEndian64(sym.value),
+        /*size*/ ...littleEndian64(sym.size),
       ]);
       nameToSymIdx.set(sym.name, symIdx);
       symIdx++;
@@ -662,12 +824,6 @@ function lower(ast) {
       entsize: 0,
     });
 
-    const alignTo = (align) => {
-      assertDefined(align);
-      const up = align - (out.buffer.length % align);
-      out.append(Array(up).fill(0));
-    };
-
     const patch32 = (baseOffset, value) => {
       assertDefined(baseOffset, value);
       const encoded = littleEndian32(value);
@@ -677,14 +833,18 @@ function lower(ast) {
       out.buffer[baseOffset + 3] = encoded[3];
     };
 
-    alignTo(16);
+    alignTo(out, 16);
     patch32(sectionOffsetRefs[".text"], out.currentPos);
     out.append(textContent);
+
+    alignTo(out, 8);
+    patch32(sectionOffsetRefs[".rela"], out.currentPos);
+    out.append(rel.buffer);
 
     patch32(sectionOffsetRefs[".strtab"], out.currentPos);
     out.append(strs.out.buffer);
 
-    alignTo(8);
+    alignTo(out, 8);
     patch32(sectionOffsetRefs[".symtab"], out.currentPos);
     out.append(symtab.buffer);
 
@@ -701,10 +861,11 @@ function lower(ast) {
     funcs.push({
       name: func.name.ident,
       code: ib.out,
+      relocations: ib.relocations,
     });
   }
 
-  console.log(funcs);
+  console.dir(funcs, { depth: 5 });
 
   const obj = generateObjectFile(funcs);
 
@@ -730,7 +891,7 @@ function link(object) {
       } else {
         reject(new CompilerError("gcc failed to link", 0));
       }
-    })
+    });
   });
 }
 
@@ -758,8 +919,16 @@ try {
   }
 }
 
-function assertDefined(...values) {
-  if (values.some((value) => value === undefined || value === null)) {
-    throw new Error(`assertion failed, value undefined or null`);
+function assert(condition) {
+  if (!condition) {
+    throw new Error("assertion failed");
   }
+}
+
+function assertDefined(...values) {
+  values.forEach((value, i) => {
+    if (value === null || value === undefined) {
+      throw new Error(`assertion failed, argument ${i} undefined or null`);
+    }
+  });
 }
