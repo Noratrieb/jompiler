@@ -269,19 +269,46 @@ function parse(tokens) {
     return parseComma(tok);
   }
 
+  function parseStatement(tok) {
+    switch (tok.peek()?.kind) {
+      case "ident": {
+        switch (tok.peek()?.ident) {
+          case "return": {
+            const span = tok.next("return").span;
+            let rhs = undefined;
+            if (tok.peek()?.kind !== ";") {
+              rhs = parseExpr(tok);
+            }
+
+            return {
+              kind: "return",
+              rhs,
+              span,
+            };
+          }
+          default: {
+            // fallthrough
+          }
+        }
+      }
+      default: {
+        const expr = parseExpr(tok);
+        return {
+          kind: "expr",
+          expr,
+          span: expr.span,
+        };
+      }
+    }
+  }
+
   function parseBlock(tok) {
     tok.expect("{", "start of block");
 
     const statements = [];
 
     while (tok.peek()?.kind !== "}") {
-      // TODO: non-expression statements
-      const expr = parseExpr(tok);
-      statements.push({
-        kind: "expr",
-        expr,
-        span: expr.span,
-      });
+      statements.push(parseStatement(tok));
       tok.expect(";", "end of statement");
     }
 
@@ -477,6 +504,7 @@ function lower(ast) {
           throw new Error("bad");
         }
 
+        // TODO: save
         codegenExpr(ib, expr.args[0]);
         ib.movEaxToEdi();
         ib.call(expr.lhs.string);
@@ -505,7 +533,10 @@ function lower(ast) {
           break;
         }
         default: {
-          throw new Error(`unsupported stmt: ${stmt.kind}`);
+          if (stmt.rhs) {
+            codegenExpr(ib, stmt.rhs);
+          }
+          ib.ret();
         }
       }
     }
@@ -706,7 +737,6 @@ function lower(ast) {
 
     // text section
     const textIndex = sectionCount;
-    console.log(textContent);
     writeSectionHeader(".text", {
       type: /*SHT_PROGBITS*/ 1,
       flags: /*SHF_ALLOC*/ (1 << 1) | /*SHF_EXECINSTR*/ (1 << 2),
@@ -743,9 +773,7 @@ function lower(ast) {
       // r_addend
       rel.append(signedLittleEndian64(relocation.addend));
     }
-    console.log(symbols, rel.buffer.length);
     const symtabIndex = sectionCount + 1;
-    console.log("text", textIndex);
     writeSectionHeader(".rela", {
       type: /*SHT_RELA*/ 4,
       flags: 0,
