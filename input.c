@@ -2,10 +2,11 @@
 
 int main(int argc)
 {
-   exit(thisismyfakeconstantbecauseidonthaveconstant(1));
+  thisismyfakeconstantbecauseidonthaveconstant(1);
+  exit(42);
 }
 
 int thisismyfakeconstantbecauseidonthaveconstant(int x)
 {
-   return 1 + 1;
+  // return 1 + 1;
 }

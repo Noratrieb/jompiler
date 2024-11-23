@@ -415,7 +415,6 @@ function lower(ast) {
       array[6] = 0xff;
       array[7] = 0xff;
     }
-    console.log(array);
     return array;
   }
 
@@ -456,15 +455,70 @@ function lower(ast) {
 
   const REG_IGNORED = 0;
   function modRm(mod, rm, reg) {
+    assert(mod <= 0b11);
+    assert(rm <= 0b111);
+    assert(reg <= 0b111);
     return (mod << 6) | rm | (reg << 3);
   }
 
+  const REX = {
+    W_OPERAND_SIZE_DETERMINED: 0,
+    W_64_BIT_OPERAND_SIZE: 1,
+  };
+
+  function rex(w, r, x, b) {
+    assert(w <= 1);
+    assert(r <= 1);
+    assert(x <= 1);
+    assert(b <= 1);
+    return 0b0100_0000 | (w << 3) | (r << 2) | (x << 1) | b;
+  }
+
   class InstBuilder {
+    /**
+     * The reserved stack space for locals and intermediary values.
+     * todo todo something
+     */
     #stackSize;
+    #patches;
     constructor() {
       this.out = new Uint8Array();
       this.relocations = [];
       this.#stackSize = 0;
+      this.#patches = [];
+
+      this.#prologue();
+    }
+
+    #prologue() {
+      // push rbp
+      this.pushReg64(REG_BP); // push british petroleum
+      // sub rsp, SIZE
+      this.subImm(REG_SP, 0);
+      this.#patches.push({
+        start: this.out.length - 4,
+        patch: () => littleEndian32(this.#stackSize),
+      });
+      // mov rbp, rsp
+      this.movRegReg64(REG_BP, REG_SP);
+    }
+
+    #epilogue() {
+      // mov rsp, rbp
+      this.movRegReg64(REG_SP, REG_BP);
+      // pop rbp
+      this.popReg64(REG_BP);
+    }
+
+    finish() {
+      this.#epilogue();
+      this.#patches.forEach((patch) => {
+        const result = patch.patch();
+        assert(Array.isArray(result));
+        result.forEach((v, i) => {
+          this.out[patch.start + i] = v;
+        });
+      });
     }
 
     reserveStack(size) {
@@ -481,9 +535,38 @@ function lower(ast) {
       ]);
     }
 
-    movEaxToEdi() {
-      // mov edi, eax ; Move r/m32 to r32
-      this.#append([0x8b, modRm(MOD_REG, RM_A, RM_DI)]);
+    movRegReg32(to, from) {
+      // ; Move r/m32 to r32
+      this.#append([0x8b, modRm(MOD_REG, from, to)]);
+    }
+
+    movRegReg64(to, from) {
+      // ; Move r/m64 to r64.
+      this.#append([
+        rex(REX.W_64_BIT_OPERAND_SIZE, 0, 0, 0),
+        0x8b,
+        modRm(MOD_REG, from, to),
+      ]);
+    }
+
+    pushReg64(reg) {
+      // 58+rd ; Push r64.
+      this.#append([0x50 | reg]);
+    }
+
+    popReg64(reg) {
+      // 50+rd ; Pop top of stack into r64; increment stack pointer.
+      this.#append([0x58 | reg]);
+    }
+
+    subImm(reg, imm) {
+      // REX.W + 81 /5 id  ; Subtract imm32 sign-extended to 64-bits from r/m64.
+      this.#append([
+        rex(REX.W_64_BIT_OPERAND_SIZE, 0, 0, 0),
+        0x81,
+        modRm(MOD_REG, reg, 5 /* /5*/),
+        ...littleEndian32(imm),
+      ]);
     }
 
     call(symbol) {
@@ -522,7 +605,8 @@ function lower(ast) {
 
         // TODO: save
         codegenExpr(ib, expr.args[0]);
-        ib.movEaxToEdi();
+        // mov edi, eax
+        ib.movRegReg32(REG_DI, REG_A);
         ib.call(expr.lhs.string);
 
         break;
@@ -550,16 +634,22 @@ function lower(ast) {
           codegenExpr(ib, stmt.expr);
           break;
         }
-        default: {
+        case "return": {
           if (stmt.rhs) {
             codegenExpr(ib, stmt.rhs);
           }
+          ib.finish();
           ib.ret();
+          break;
+        }
+        default: {
+          assert(false);
         }
       }
     }
 
     ib.movEaxImm32(0);
+    ib.finish();
     ib.ret();
 
     return ib;
@@ -642,7 +732,7 @@ function lower(ast) {
       });
     }
 
-    console.log(funcRelocations);
+    console.log("relocations", funcRelocations);
 
     let out = new BufferBuilder();
     // ident
@@ -782,7 +872,6 @@ function lower(ast) {
           size: 0,
         });
       }
-      console.log(rel.buffer.length);
       // r_offset
       rel.append([...littleEndian32(relocation.offset), ...[0, 0, 0, 0]]);
       // r_info type,sym
@@ -918,34 +1007,40 @@ function lower(ast) {
   return obj;
 }
 
-function link(object) {
+async function link(object) {
+  async function execWithForwardedOutput(command, args) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(command, args, {
+        stdio: "inherit",
+      });
+      child.on("close", (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new CompilerError("gcc failed to link", 0));
+        }
+      });
+    });
+  }
+
   // we could use a temporary directory in the future, but let's keep this debuggable for now
   const outputFile = "output.o";
   fs.writeFile(outputFile, object);
 
-  return new Promise((resolve, reject) => {
-    const gcc = spawn("gcc", [outputFile]);
-    gcc.stdout.on("data", (data) => {
-      process.stdout.write(data);
-    });
-    gcc.stderr.on("data", (data) => {
-      process.stderr.write(data);
-    });
-    gcc.on("close", (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new CompilerError("gcc failed to link", 0));
-      }
-    });
-  });
+  await execWithForwardedOutput("gcc", [outputFile]);
+  await execWithForwardedOutput("gdb", [
+    "--batch",
+    "--command",
+    "dump-main.gdb",
+    "a.out",
+  ]);
 }
 
 async function compile(input) {
   const tokens = lex(input);
-  console.log(tokens);
+  console.log("tokens", tokens);
   const ast = parse(tokens);
-  console.dir(ast, { depth: 20 });
+  console.dir("ast", ast, { depth: 20 });
   const object = lower(ast);
 
   return link(object);
@@ -953,7 +1048,7 @@ async function compile(input) {
 
 const fileName = process.argv[2];
 const input = await fs.readFile(fileName, "utf-8");
-console.log(input);
+console.log("input", input);
 
 try {
   await compile(input);
