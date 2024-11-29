@@ -453,12 +453,14 @@ function lower(ast) {
 
   const RELOCATIONS = {
     R_X86_64_PC32: 2,
+    R_X86_64_PLT32: 4,
   };
   const SYMBOL_TYPES = {
     STT_NOTYPE: 0,
     STT_FUNC: 2,
   };
   const SYMBOL_BINDING = {
+    STB_LOCAL: 0,
     STB_GLOBAL: 1,
   };
   const SYMBOL_VISIBILITY = {
@@ -653,7 +655,7 @@ function lower(ast) {
       //            ; 64-bits in 64-bit mode
       this.#append([0xe8]);
       this.relocations.push({
-        kind: RELOCATIONS.R_X86_64_PC32,
+        kind: RELOCATIONS.R_X86_64_PC32, // pietro said i should use this even though PC_32 works too
         symbol,
         offset: this.out.length,
         addend: -4,
@@ -844,7 +846,17 @@ function lower(ast) {
       };
     }
 
-    const symbols = [];
+    const symbols = [
+      {
+        name: "",
+        type: SYMBOL_TYPES.STT_NOTYPE,
+        binding: SYMBOL_BINDING.STB_LOCAL,
+        visibility: SYMBOL_VISIBILITY.STV_DEFAULT,
+        sectionIndex: 0,
+        value: 0,
+        size: 0,
+      },
+    ];
 
     const {
       textContent,
@@ -1045,6 +1057,10 @@ function lower(ast) {
 
     // symtab section
     const strTableIndex = sectionCount + 1;
+    const firstGlobal = symbols.findIndex(
+      (sym) => sym.binding === SYMBOL_BINDING.STB_GLOBAL
+    );
+    assertDefined(firstGlobal);
     writeSectionHeader(".symtab", {
       type: /*SHT_SYMTAB*/ 2,
       flags: 0,
@@ -1052,7 +1068,7 @@ function lower(ast) {
       offset: 0,
       size: symtab.buffer.length,
       link: strTableIndex,
-      info: 0,
+      info: firstGlobal,
       addralign: 8,
       entsize: 24,
     });
@@ -1159,7 +1175,7 @@ async function link(object) {
   const outputFile = "output.o";
   fs.writeFile(outputFile, object);
 
-  await execWithForwardedOutput("gcc", [outputFile]);
+  await execWithForwardedOutput("gcc", ["-Wl,-znoexecstack", outputFile]);
   await execWithForwardedOutput("gdb", [
     "--batch",
     "--command",

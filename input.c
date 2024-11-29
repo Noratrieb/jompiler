@@ -3,8 +3,7 @@
 int main(int argc, int argv)
 {
   int x = 100;
-  thisismyfakeconstantbecauseidonthaveconstant(x - 1);
-  return argv;
+  return thisismyfakeconstantbecauseidonthaveconstant(x - 1);
 }
 
 int thisismyfakeconstantbecauseidonthaveconstant(int x)
