@@ -1,10 +1,10 @@
 // #include<elf.h>
 
-int main(int argc)
+int main(int argc, int argv)
 {
   int x = 100;
-  int x = 200;
-  return x;
+  thisismyfakeconstantbecauseidonthaveconstant(x - 1);
+  return argv;
 }
 
 int thisismyfakeconstantbecauseidonthaveconstant(int x)

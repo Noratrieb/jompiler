@@ -105,6 +105,7 @@ function lex(input) {
         case ",":
         case ";":
         case "+":
+        case "-":
         case "=": {
           tokens.push({
             kind: head,
@@ -362,6 +363,9 @@ function parse(tokens) {
     const params = [];
 
     while (tok.peek()?.kind !== ")") {
+      if (params.length > 0) {
+        tok.expect(",", "function parameter separator");
+      }
       const type = parseType(tok, "function parameter");
       const name = tok.next("function name");
       if (name.kind !== "ident") {
@@ -382,8 +386,9 @@ function parse(tokens) {
 
     return {
       kind: "function",
-      ret,
       name,
+      params,
+      ret,
       body,
     };
   }
@@ -481,6 +486,8 @@ function lower(ast) {
   const REG_SI = RM_SI;
   const REG_DI = RM_DI;
 
+  const PARAM_CALLCONV_REGISTERS = [REG_DI, REG_SI, REG_D, REG_C];
+
   const REG_IGNORED = 0;
   function modRm(mod, reg, rm) {
     assert(mod <= 0b11);
@@ -560,6 +567,15 @@ function lower(ast) {
       this.#append([
         rex(REX.W_64_BIT_OPERAND_SIZE, 0, 0, 0),
         0x03,
+        modRm(MOD_REG, reg1, reg2),
+      ]);
+    }
+
+    subRegs(reg1, reg2) {
+      // REX.W + 03 /r | ADD r64, r/m64 ; Add r/m64 to r64
+      this.#append([
+        rex(REX.W_64_BIT_OPERAND_SIZE, 0, 0, 0),
+        0x2b,
         modRm(MOD_REG, reg1, reg2),
       ]);
     }
@@ -656,6 +672,7 @@ function lower(ast) {
   }
 
   function codegenExpr(ctx, expr) {
+    assert(!Number.isNaN(ctx.offset));
     const { ib, variables } = ctx;
     switch (expr.kind) {
       case "call": {
@@ -683,7 +700,7 @@ function lower(ast) {
           .reverse()
           .find((v) => v.name === expr.string);
         assert(offset);
-        ib.movStackOffsetToReg(offset.stackOffset, REG_A);
+        ib.movStackOffsetToReg(offset.stackOffset + ctx.offset, REG_A);
         break;
       }
       case "+": {
@@ -691,10 +708,19 @@ function lower(ast) {
         // evaluate the RHS, then restore the LHS and perform the operation.
         codegenExpr(ctx, expr.lhs);
         ib.pushReg64(REG_A); // push rax
-        codegenExpr(ctx, expr.rhs);
+        codegenExpr({ ...ctx, offset: ctx.offset + 8 }, expr.rhs);
         ib.popReg64(REG_C); // pop rcx
 
         ib.addRegs(REG_A, REG_C);
+        break;
+      }
+      case "-": {
+        codegenExpr(ctx, expr.rhs);
+        ib.pushReg64(REG_A); // push rax
+        codegenExpr({ ...ctx, offset: ctx.offset + 8 }, expr.lhs);
+        ib.popReg64(REG_C); // pop rcx
+
+        ib.subRegs(REG_A, REG_C);
         break;
       }
       default: {
@@ -707,15 +733,28 @@ function lower(ast) {
     const ib = new InstBuilder();
     const variables = [];
 
+    assert(func.params.length <= 4);
+
+    func.params.forEach((param, i) => {
+      assert(param.type.kind === "int");
+      const offset = ib.reserveStack(4);
+      ib.movRegToStackOffset(offset, PARAM_CALLCONV_REGISTERS[i]);
+      variables.push({
+        name: param.name,
+        stackOffset: offset,
+      });
+    });
+
     for (const stmt of func.body) {
+      const ctx = { ib, variables, offset: 0 };
       switch (stmt.kind) {
         case "expr": {
-          codegenExpr({ ib, variables }, stmt.expr);
+          codegenExpr(ctx, stmt.expr);
           break;
         }
         case "return": {
           if (stmt.rhs) {
-            codegenExpr({ ib, variables }, stmt.rhs);
+            codegenExpr(ctx, stmt.rhs);
           }
           ib.finish();
           ib.ret();
@@ -724,7 +763,7 @@ function lower(ast) {
         case "declaration": {
           assert(stmt.type === "int");
           if (stmt.init) {
-            codegenExpr({ ib, variables }, stmt.init);
+            codegenExpr(ctx, stmt.init);
           }
           const slot = ib.reserveStack(4);
           variables.push({
@@ -1163,7 +1202,7 @@ function assert(condition) {
 function assertDefined(...values) {
   values.forEach((value, i) => {
     if (value === null || value === undefined) {
-      throw new Error(`assertion failed, argument ${i} undefined or null`);
+      throw new Error(`assertion failed, argument ${i} undefined or nu ll`);
     }
   });
 }
