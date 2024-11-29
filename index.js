@@ -104,7 +104,8 @@ function lex(input) {
         case "}":
         case ",":
         case ";":
-        case "+": {
+        case "+":
+        case "=": {
           tokens.push({
             kind: head,
             span: i - 1,
@@ -302,6 +303,25 @@ function parse(tokens) {
               span,
             };
           }
+          case "int": {
+            const typeSpan = tok.next("ident").span;
+            const name = tok.next("ident");
+
+            tok.next("=");
+
+            let init;
+            if (tok.peek()?.kind !== ";") {
+              init = parseExpr(tok);
+            }
+
+            return {
+              kind: "declaration",
+              type: "int",
+              name: name.ident,
+              span: typeSpan,
+              init,
+            };
+          }
           default: {
             // fallthrough
           }
@@ -382,14 +402,20 @@ function lower(ast) {
   x86-64 codegen.
 
   strategy: every expression returns its result in rax.
+
+  useful:
+  - https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+  - https://gitlab.com/x86-psABIs/x86-64-ABI
   */
 
   function littleEndian16(number) {
     assertDefined(number);
+    assert(typeof number === "number");
     return [number & 0xff, (number >> 8) & 0xff];
   }
   function littleEndian32(number) {
     assertDefined(number);
+    assert(typeof number === "number");
     return [
       number & 0xff,
       (number >> 8) & 0xff,
@@ -400,12 +426,14 @@ function lower(ast) {
   function littleEndian64(number) {
     assertDefined(number);
     assert(number <= 0xff_ff_ff_ff);
+    assert(typeof number === "number");
     return [...littleEndian32(number), 0, 0, 0, 0];
   }
   function signedLittleEndian64(number) {
     assertDefined(number);
     assert(number <= 0xff_ff_ff_ff);
     assert(number >= -(0xff_ff_ff_ff + 1));
+    assert(typeof number === "number");
 
     const array = littleEndian64(number);
     const signBit = array[3] & 0b10000000;
@@ -454,11 +482,11 @@ function lower(ast) {
   const REG_DI = RM_DI;
 
   const REG_IGNORED = 0;
-  function modRm(mod, rm, reg) {
+  function modRm(mod, reg, rm) {
     assert(mod <= 0b11);
     assert(rm <= 0b111);
     assert(reg <= 0b111);
-    return (mod << 6) | rm | (reg << 3);
+    return (mod << 6) | (reg << 3) | rm;
   }
 
   const REX = {
@@ -477,7 +505,7 @@ function lower(ast) {
   class InstBuilder {
     /**
      * The reserved stack space for locals and intermediary values.
-     * todo todo something
+     * We subtract rsp by this value in the beginning.
      */
     #stackSize;
     #patches;
@@ -493,14 +521,14 @@ function lower(ast) {
     #prologue() {
       // push rbp
       this.pushReg64(REG_BP); // push british petroleum
+      // mov rbp, rsp
+      this.movRegReg64(REG_BP, REG_SP);
       // sub rsp, SIZE
       this.subImm(REG_SP, 0);
       this.#patches.push({
         start: this.out.length - 4,
         patch: () => littleEndian32(this.#stackSize),
       });
-      // mov rbp, rsp
-      this.movRegReg64(REG_BP, REG_SP);
     }
 
     #epilogue() {
@@ -522,22 +550,56 @@ function lower(ast) {
     }
 
     reserveStack(size) {
+      const prev = this.#stackSize;
       this.#stackSize += size;
-      return this.#stackSize;
+      return prev;
+    }
+
+    addRegs(reg1, reg2) {
+      // REX.W + 03 /r | ADD r64, r/m64 ; Add r/m64 to r64
+      this.#append([
+        rex(REX.W_64_BIT_OPERAND_SIZE, 0, 0, 0),
+        0x03,
+        modRm(MOD_REG, reg1, reg2),
+      ]);
+    }
+
+    movRegToStackOffset(offset, reg) {
+      // mov [rsp+{offset}], reg
+      // 89 /r, MOV r/m64, r64
+      this.#append([
+        0x89,
+        // [--][--]+disp32
+        modRm(0b10, reg, 0b100),
+        0x24, // SIB: Scaled index: none, Base: ESP
+        ...littleEndian32(offset),
+      ]);
+    }
+
+    movStackOffsetToReg(offset, reg) {
+      // mov reg, [rsp+{offset}]
+      // 89 /r, MOV r/m64, r64
+      this.#append([
+        0x8b,
+        // [--][--]+disp32
+        modRm(0b10, reg, 0b100),
+        0x24, // SIB: Scaled index: none, Base: ESP
+        ...littleEndian32(offset),
+      ]);
     }
 
     movEaxImm32(imm) {
       // mov eax, imm
       this.#append([
         0xc7,
-        modRm(MOD_REG, RM_A, REG_IGNORED),
+        modRm(MOD_REG, REG_IGNORED, RM_A),
         ...littleEndian32(imm),
       ]);
     }
 
     movRegReg32(to, from) {
       // ; Move r/m32 to r32
-      this.#append([0x8b, modRm(MOD_REG, from, to)]);
+      this.#append([0x8b, modRm(MOD_REG, to, from)]);
     }
 
     movRegReg64(to, from) {
@@ -545,7 +607,7 @@ function lower(ast) {
       this.#append([
         rex(REX.W_64_BIT_OPERAND_SIZE, 0, 0, 0),
         0x8b,
-        modRm(MOD_REG, from, to),
+        modRm(MOD_REG, to, from),
       ]);
     }
 
@@ -564,7 +626,7 @@ function lower(ast) {
       this.#append([
         rex(REX.W_64_BIT_OPERAND_SIZE, 0, 0, 0),
         0x81,
-        modRm(MOD_REG, reg, 5 /* /5*/),
+        modRm(MOD_REG, 5 /* /5*/, reg),
         ...littleEndian32(imm),
       ]);
     }
@@ -593,7 +655,8 @@ function lower(ast) {
     }
   }
 
-  function codegenExpr(ib, expr) {
+  function codegenExpr(ctx, expr) {
+    const { ib, variables } = ctx;
     switch (expr.kind) {
       case "call": {
         if (expr.lhs.kind !== "ident") {
@@ -604,7 +667,7 @@ function lower(ast) {
         }
 
         // TODO: save
-        codegenExpr(ib, expr.args[0]);
+        codegenExpr(ctx, expr.args[0]);
         // mov edi, eax
         ib.movRegReg32(REG_DI, REG_A);
         ib.call(expr.lhs.string);
@@ -615,9 +678,24 @@ function lower(ast) {
         ib.movEaxImm32(expr.integer);
         break;
       }
+      case "ident": {
+        const offset = [...variables]
+          .reverse()
+          .find((v) => v.name === expr.string);
+        assert(offset);
+        ib.movStackOffsetToReg(offset.stackOffset, REG_A);
+        break;
+      }
       case "+": {
-        codegenExpr(ib, expr.rhs);
-        assert(false);
+        // For binary expressions, we first evaluate the LHS, save it on the stack,
+        // evaluate the RHS, then restore the LHS and perform the operation.
+        codegenExpr(ctx, expr.lhs);
+        ib.pushReg64(REG_A); // push rax
+        codegenExpr(ctx, expr.rhs);
+        ib.popReg64(REG_C); // pop rcx
+
+        ib.addRegs(REG_A, REG_C);
+        break;
       }
       default: {
         throw new Error(`unsupported expr: ${expr.kind}`);
@@ -627,19 +705,34 @@ function lower(ast) {
 
   function codegenFunction(func) {
     const ib = new InstBuilder();
+    const variables = [];
 
     for (const stmt of func.body) {
       switch (stmt.kind) {
         case "expr": {
-          codegenExpr(ib, stmt.expr);
+          codegenExpr({ ib, variables }, stmt.expr);
           break;
         }
         case "return": {
           if (stmt.rhs) {
-            codegenExpr(ib, stmt.rhs);
+            codegenExpr({ ib, variables }, stmt.rhs);
           }
           ib.finish();
           ib.ret();
+          break;
+        }
+        case "declaration": {
+          assert(stmt.type === "int");
+          if (stmt.init) {
+            codegenExpr({ ib, variables }, stmt.init);
+          }
+          const slot = ib.reserveStack(4);
+          variables.push({
+            name: stmt.name,
+            stackOffset: slot,
+          });
+          // mov [rsp+{slot}], eax
+          ib.movRegToStackOffset(slot, REG_A);
           break;
         }
         default: {
@@ -1040,7 +1133,8 @@ async function compile(input) {
   const tokens = lex(input);
   console.log("tokens", tokens);
   const ast = parse(tokens);
-  console.dir("ast", ast, { depth: 20 });
+  console.log("ast");
+  console.dir(ast, { depth: 20 });
   const object = lower(ast);
 
   return link(object);
