@@ -4,6 +4,8 @@ import fs from "node:fs/promises";
 // https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf
 // yep.
 
+const BUFFER_LE = true;
+
 class CompilerError extends Error {
   constructor(message, span) {
     super(message);
@@ -790,23 +792,43 @@ function lower(ast) {
   }
 
   class BufferBuilder {
+    #buffer
     constructor() {
-      this.buffer = new Uint8Array();
+      this.#buffer = new ArrayBuffer(0, {maxByteLength: 2**32});
     }
     append(array) {
       assertDefined(array);
       array.forEach((elem) => assert(typeof elem === "number"));
-      this.buffer = Buffer.concat([this.buffer, new Uint8Array(array)]);
+
+      const oldLength = this.length;
+      const newLength = oldLength + array.length;
+      this.#buffer.resize(newLength);
+
+      for (let i = 0; i < array.length; i++) {
+        new DataView(this.#buffer).setUint8(oldLength + i, array[i]);
+      }
+    }
+    get length() {
+      return this.#buffer.byteLength;
     }
     get currentPos() {
-      return this.buffer.length;
+      return this.length;
+    }
+    writeUint16Le(offset, int) {
+      new DataView(this.#buffer).setUint16(offset, int, BUFFER_LE);
+    }
+    writeUint32Le(offset, int) {
+      new DataView(this.#buffer).setUint32(offset, int, BUFFER_LE);
+    }
+    toUint8Array() {
+      return new Uint8Array(this.#buffer);
     }
   }
 
   function generateObjectFile(funcs) {
     const alignTo = (out, align) => {
       assertDefined(out, align);
-      const missing = out.buffer.length % align;
+      const missing = out.length % align;
       if (missing === 0) {
         return;
       }
@@ -822,7 +844,7 @@ function lower(ast) {
 
       funcs.forEach((func) => {
         alignTo(textContent, 8); // i think this is not actually necessary.
-        const offset = textContent.buffer.length;
+        const offset = textContent.length;
         textRelativeSymbols.push({
           name: func.name,
           offset,
@@ -840,7 +862,7 @@ function lower(ast) {
       });
 
       return {
-        textContent: textContent.buffer,
+        textContent: textContent.toUint8Array(),
         textRelativeSymbols,
         relocations,
       };
@@ -923,11 +945,7 @@ function lower(ast) {
 
     // Let's write some section headers.
 
-    const shoff = littleEndian32(out.currentPos);
-    out.buffer[shoffRef] = shoff[0];
-    out.buffer[shoffRef + 1] = shoff[1];
-    out.buffer[shoffRef + 2] = shoff[2];
-    out.buffer[shoffRef + 3] = shoff[3];
+    out.writeUint32Le(shoffRef, out.currentPos);
 
     class NullTerminatedStringStore {
       #offsets;
@@ -939,7 +957,7 @@ function lower(ast) {
         if (this.#offsets.has(str)) {
           return this.#offsets.get(str);
         }
-        const offset = this.out.buffer.length;
+        const offset = this.out.length;
         this.#offsets.set(str, offset);
         this.out.append(new TextEncoder("utf-8").encode(str));
         this.out.append([0]);
@@ -1030,7 +1048,7 @@ function lower(ast) {
       flags: 0,
       addr: 0,
       offset: 0,
-      size: rel.buffer.length,
+      size: rel.length,
       link: symtabIndex,
       info: textIndex,
       addralign: 8,
@@ -1066,7 +1084,7 @@ function lower(ast) {
       flags: 0,
       addr: 0,
       offset: 0,
-      size: symtab.buffer.length,
+      size: symtab.length,
       link: strTableIndex,
       info: firstGlobal,
       addralign: 8,
@@ -1079,20 +1097,17 @@ function lower(ast) {
       flags: 0,
       addr: 0,
       offset: 0,
-      size: strs.out.buffer.length,
+      size: strs.out.length,
       link: 0,
       info: 0,
       addralign: 1,
       entsize: 0,
     });
 
-    const shstrndx = littleEndian32(sectionCount);
-    out.buffer[shstrndxRef] = shstrndx[0];
-    out.buffer[shstrndxRef + 1] = shstrndx[1];
+    out.writeUint16Le(shstrndxRef, sectionCount);
 
-    const totalSectionCount = littleEndian32(sectionCount + 1);
-    out.buffer[shnumRef] = totalSectionCount[0];
-    out.buffer[shnumRef + 1] = totalSectionCount[1];
+    const totalSectionCount = sectionCount + 1;
+    out.writeUint16Le(shnumRef, totalSectionCount);
 
     // shstrtab section
     writeSectionHeader(".shstrtab", {
@@ -1100,7 +1115,7 @@ function lower(ast) {
       flags: 0,
       addr: 0,
       offset: 0,
-      size: shstrs.out.buffer.length,
+      size: shstrs.out.length,
       link: 0,
       info: 0,
       addralign: 1,
@@ -1109,11 +1124,7 @@ function lower(ast) {
 
     const patch32 = (baseOffset, value) => {
       assertDefined(baseOffset, value);
-      const encoded = littleEndian32(value);
-      out.buffer[baseOffset] = encoded[0];
-      out.buffer[baseOffset + 1] = encoded[1];
-      out.buffer[baseOffset + 2] = encoded[2];
-      out.buffer[baseOffset + 3] = encoded[3];
+      out.writeUint32Le(baseOffset, value);
     };
 
     alignTo(out, 16);
@@ -1122,19 +1133,19 @@ function lower(ast) {
 
     alignTo(out, 8);
     patch32(sectionOffsetRefs[".rela"], out.currentPos);
-    out.append(rel.buffer);
+    out.append(rel.toUint8Array());
 
     patch32(sectionOffsetRefs[".strtab"], out.currentPos);
-    out.append(strs.out.buffer);
+    out.append(strs.out.toUint8Array());
 
     alignTo(out, 8);
     patch32(sectionOffsetRefs[".symtab"], out.currentPos);
-    out.append(symtab.buffer);
+    out.append(symtab.toUint8Array());
 
     patch32(sectionOffsetRefs[".shstrtab"], out.currentPos);
-    out.append(shstrs.out.buffer);
+    out.append(shstrs.out.toUint8Array());
 
-    return out.buffer;
+    return out.toUint8Array();
   }
 
   const funcs = [];
