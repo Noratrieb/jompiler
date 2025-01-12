@@ -792,9 +792,30 @@ function lower(ast) {
   }
 
   class BufferBuilder {
-    #buffer
+    #buffer;
     constructor() {
-      this.#buffer = new ArrayBuffer(0, {maxByteLength: 2**32});
+      this.#buffer = new ArrayBuffer(0, { maxByteLength: 2 ** 32 });
+    }
+    #appendUintGeneric(size, name, int) {
+      assertDefined(int);
+      assert(typeof int === "number" || typeof int === "bigint");
+
+      const oldLength = this.length;
+      this.#buffer.resize(oldLength + size);
+      new DataView(this.#buffer)[name](oldLength, int, BUFFER_LE);
+    }
+    appendUint8(int) {
+      this.#appendUintGeneric(1, "setUint8", int);
+    }
+    appendUint16Le(int) {
+      this.#appendUintGeneric(2, "setUint16", int);
+    }
+    appendUint32Le(int) {
+      this.#appendUintGeneric(4, "setUint32", int);
+    }
+    appendUint64Le(int) {
+      assert(typeof int === "number");
+      this.#appendUintGeneric(8, "setBigUint64", BigInt(int));
     }
     append(array) {
       assertDefined(array);
@@ -815,9 +836,11 @@ function lower(ast) {
       return this.length;
     }
     writeUint16Le(offset, int) {
+      assertDefined(offset, int);
       new DataView(this.#buffer).setUint16(offset, int, BUFFER_LE);
     }
     writeUint32Le(offset, int) {
+      assertDefined(offset, int);
       new DataView(this.#buffer).setUint32(offset, int, BUFFER_LE);
     }
     toUint8Array() {
@@ -975,21 +998,17 @@ function lower(ast) {
     const writeSectionHeader = (name, sh) => {
       sectionCount++;
       const nameIndex = shstrs.pushAndGet(name);
-      out.append([
-        ...littleEndian32(nameIndex),
-        ...littleEndian32(sh.type),
-        ...littleEndian64(sh.flags),
-        ...littleEndian64(sh.addr),
-      ]);
+      out.appendUint32Le(nameIndex);
+      out.appendUint32Le(sh.type);
+      out.appendUint64Le(sh.flags);
+      out.appendUint64Le(sh.addr);
       sectionOffsetRefs[name] = out.currentPos;
-      out.append([
-        ...littleEndian64(sh.offset),
-        ...littleEndian64(sh.size),
-        ...littleEndian32(sh.link),
-        ...littleEndian32(sh.info),
-        ...littleEndian64(sh.addralign),
-        ...littleEndian64(sh.entsize),
-      ]);
+      out.appendUint64Le(sh.offset);
+      out.appendUint64Le(sh.size);
+      out.appendUint32Le(sh.link);
+      out.appendUint32Le(sh.info);
+      out.appendUint64Le(sh.addralign);
+      out.appendUint64Le(sh.entsize);
     };
 
     // null section
@@ -1035,12 +1054,12 @@ function lower(ast) {
         });
       }
       // r_offset
-      rel.append([...littleEndian32(relocation.offset), ...[0, 0, 0, 0]]);
+      rel.appendUint64Le(relocation.offset);
       // r_info type,sym
-      rel.append(littleEndian32(relocation.kind));
-      rel.append(littleEndian32(idx));
+      rel.appendUint32Le(relocation.kind);
+      rel.appendUint32Le(idx);
       // r_addend
-      rel.append(signedLittleEndian64(relocation.addend));
+      rel.appendUint64Le(relocation.addend);
     }
     const symtabIndex = sectionCount + 1;
     writeSectionHeader(".rela", {
@@ -1060,15 +1079,13 @@ function lower(ast) {
     let symIdx = 0;
     for (const sym of symbols) {
       const nameIdx = strs.pushAndGet(sym.name);
+      symtab.appendUint32Le(nameIdx);
+      symtab.appendUint8(sym.type | (sym.binding << 4));
+      symtab.appendUint8(sym.visibility);
+      symtab.appendUint16Le(sym.sectionIndex);
+      symtab.appendUint64Le(sym.value);
+      symtab.appendUint64Le(sym.size);
 
-      symtab.append([
-        ...littleEndian32(nameIdx),
-        sym.type | (sym.binding << 4),
-        sym.visibility,
-        /*shndx*/ ...littleEndian16(sym.sectionIndex),
-        /*value*/ ...littleEndian64(sym.value),
-        /*size*/ ...littleEndian64(sym.size),
-      ]);
       nameToSymIdx.set(sym.name, symIdx);
       symIdx++;
     }
